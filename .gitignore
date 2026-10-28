@@ -1,0 +1,42 @@
+# Build output (CMake)
+build/
+cmake-build-*/
+
+# Compiled objects / binaries
+*.o
+*.a
+*.so
+*.out
+
+# Kernel module build artifacts (Kbuild)
+*.ko
+*.ko.cmd
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+.cache.mk
+
+# Captured frames and benchmark data
+*.yuv
+*.raw
+*.ppm
+bench/results/*.csv
+bench/*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Signing keys: never commit private keys
+*.priv
+*.key
