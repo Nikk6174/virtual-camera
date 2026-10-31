@@ -40,3 +40,8 @@ __pycache__/
 # Signing keys: never commit private keys
 *.priv
 *.key
+
+# Personal notes, kept local only (not on GitHub)
+CLAUDE.md
+NEXT_STEPS.md
+LEARNING.md
