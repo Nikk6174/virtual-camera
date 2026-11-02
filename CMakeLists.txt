@@ -33,3 +33,9 @@ target_include_directories(pipeline PUBLIC pipeline)
 find_package(SDL2 REQUIRED CONFIG)
 add_executable(preview pipeline/preview.cpp)
 target_link_libraries(preview PRIVATE pipeline v4l2_capture SDL2::SDL2)
+
+# Step 4: the same video path split across capture, process and output threads.
+# Threads::Threads adds whatever the system needs to use std::thread.
+find_package(Threads REQUIRED)
+add_executable(threaded_pipeline pipeline/threaded_pipeline.cpp)
+target_link_libraries(threaded_pipeline PRIVATE pipeline v4l2_capture SDL2::SDL2 Threads::Threads)
