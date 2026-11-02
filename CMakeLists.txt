@@ -23,8 +23,8 @@ add_library(v4l2_capture STATIC capture/v4l2_capture.c)
 # Anyone linking v4l2_capture can #include "v4l2_capture.h" without a path.
 target_include_directories(v4l2_capture PUBLIC capture)
 
-# Step 2+: C++ processing code (colour conversion; filters arrive in Step 3).
-add_library(pipeline STATIC pipeline/convert.cpp)
+# Step 2+: C++ processing code: colour conversion (Step 2) and filters (Step 3).
+add_library(pipeline STATIC pipeline/convert.cpp pipeline/filters.cpp)
 target_include_directories(pipeline PUBLIC pipeline)
 
 # Step 2: live preview window. SDL2 ships a CMake config file

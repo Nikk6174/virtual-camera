@@ -1,35 +1,46 @@
 /*
- * preview.cpp - Step 2: live webcam preview in an SDL2 window, with FPS.
+ * preview.cpp - Steps 2-3: live webcam preview with switchable filters.
  *
  * WHAT IT DOES
- *   Opens the camera, then loops: wait for a frame -> convert YUYV to RGB
- *   straight into an SDL texture -> give the camera buffer back -> draw the
- *   texture in the window. Shows FPS, conversion time and dropped frames in
- *   the window title. Quit with Esc, Q, the window's close button, or Ctrl+C.
+ *   Opens the camera, then loops: wait for a frame -> convert YUYV to RGB ->
+ *   give the camera buffer back -> run the selected filter -> draw the result
+ *   in the window. The window title shows the filter, FPS, per-frame times and
+ *   dropped frames.
+ *
+ * KEYS
+ *   1-6        pick a filter: none, brightness/contrast, grayscale, blur,
+ *              sharpen, edges
+ *   Up/Down    brightness +/- 5 (also selects the brightness/contrast filter)
+ *   Right/Left contrast +/- 0.1 (also selects the brightness/contrast filter)
+ *   R          reset brightness and contrast
+ *   Esc or Q   quit (the close button and Ctrl+C also work)
  *
  * HOW IT CONNECTS TO THE REST OF THE PROJECT
  *   - capture/v4l2_capture.h : capture_open/start/dequeue/requeue/close (C library)
  *   - pipeline/convert.h     : vc::yuyv_to_rgb24 (our hand-written converter)
+ *   - pipeline/filters.h     : vc::FilterRunner (our hand-written filters)
  *   - SDL2                   : ONLY used to show pixels on screen (window,
  *                              texture upload, key events). No SDL drawing or
  *                              image processing, per the project rules.
- *   - Step 3 adds filters between "convert" and "draw".
  *   - Step 4 splits this single loop into capture / process / output threads.
  *
- * Usage: ./preview [device] [--frames N]
+ * Usage: ./preview [device] [--frames N] [--filter K]
  *   --frames N  quit after N frames and print a summary (used for testing
  *               and, later, for benchmarks)
+ *   --filter K  start with filter K (1-6, same numbers as the keys)
  */
 
 #include <SDL.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
+#include <vector>
 
 #include "convert.h"
+#include "filters.h"
 #include "v4l2_capture.h"   // C header, but it has extern "C" so C++ can link to it
 
 namespace {
@@ -61,11 +72,21 @@ int main(int argc, char** argv)
     // ---- 1. Parse arguments --------------------------------------------
     const char* device     = "/dev/video0";
     long        max_frames = 0;                 // 0 = run until the user quits
+    vc::Filter  filter     = vc::Filter::None;  // which filter is active right now
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
+        if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             max_frames = std::strtol(argv[++i], nullptr, 10);
-        else
+        } else if (std::strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
+            // The user counts from 1 (like the keys); the enum counts from 0.
+            const long k = std::strtol(argv[++i], nullptr, 10);
+            if (k < 1 || k > static_cast<long>(vc::Filter::Count)) {
+                std::fprintf(stderr, "--filter must be 1-%d\n", static_cast<int>(vc::Filter::Count));
+                return EXIT_FAILURE;
+            }
+            filter = static_cast<vc::Filter>(k - 1);
+        } else {
             device = argv[i];
+        }
     }
 
     // ---- 2. Open the camera (our C module) -------------------------------
@@ -129,11 +150,24 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
+    // Filters read from one buffer and write to another, so filtered frames
+    // need somewhere to hold the RGB image between "convert" and "filter".
+    // Allocated once here, not per frame: allocating about 900 KB 30 times a
+    // second would waste time.
+    const int width  = static_cast<int>(cap.width);
+    const int height = static_cast<int>(cap.height);
+    std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3);
+    const vc::Image      rgb_image{rgb.data(), width, height, width * 3};
+
+    vc::FilterRunner runner;   // owns the scratch buffer that edge detection reuses
+    vc::FilterParams params;   // brightness and contrast, changed by the arrow keys
+
     // ---- 5. Main loop ---------------------------------------------------------
     // Statistics for the title bar, reset every second.
     long     frames_total   = 0;
     long     frames_window  = 0;      // frames shown in the current 1-second window
     double   convert_ms_sum = 0.0;    // total conversion time in this window
+    double   filter_ms_sum  = 0.0;    // total filter time in this window
     long     dropped_total  = 0;      // frames the driver produced that we never saw
     uint32_t last_seq       = 0;
     bool     have_seq       = false;
@@ -147,11 +181,41 @@ int main(int argc, char** argv)
         // SDL_PollEvent returns 0 immediately when the queue is empty.
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT)                                   // close button or Ctrl+C
+            if (ev.type == SDL_QUIT) {                                 // close button or Ctrl+C
                 running = false;
-            else if (ev.type == SDL_KEYDOWN &&
-                     (ev.key.keysym.sym == SDLK_ESCAPE || ev.key.keysym.sym == SDLK_q))
-                running = false;
+            } else if (ev.type == SDL_KEYDOWN) {
+                const SDL_Keycode key = ev.key.keysym.sym;
+                const vc::Filter  previous = filter;
+
+                if (key == SDLK_ESCAPE || key == SDLK_q) {
+                    running = false;
+                } else if (key >= SDLK_1 &&
+                           key < SDLK_1 + static_cast<int>(vc::Filter::Count)) {
+                    // SDLK_1, SDLK_2, ... are consecutive numbers, so the
+                    // distance from SDLK_1 is the filter's position in the enum.
+                    filter = static_cast<vc::Filter>(key - SDLK_1);
+                } else if (key == SDLK_UP || key == SDLK_DOWN) {
+                    // Holding a key repeats it, so clamp to keep values in range.
+                    params.brightness = std::clamp(
+                        params.brightness + (key == SDLK_UP ? 5 : -5), -100, 100);
+                    filter = vc::Filter::BrightnessContrast;   // make the change visible
+                } else if (key == SDLK_RIGHT || key == SDLK_LEFT) {
+                    params.contrast = std::clamp(
+                        params.contrast + (key == SDLK_RIGHT ? 0.1f : -0.1f), 0.2f, 3.0f);
+                    filter = vc::Filter::BrightnessContrast;
+                } else if (key == SDLK_r) {
+                    params = vc::FilterParams{};               // back to the defaults
+                }
+
+                // Times from different filters must not be averaged together,
+                // so a new filter starts a new 1-second measurement window.
+                if (filter != previous) {
+                    frames_window  = 0;
+                    convert_ms_sum = 0.0;
+                    filter_ms_sum  = 0.0;
+                    window_start   = Clock::now();
+                }
+            }
         }
         if (!running)
             break;
@@ -174,30 +238,48 @@ int main(int argc, char** argv)
         last_seq = f.sequence;
         have_seq = true;
 
-        // 5c. Convert YUYV -> RGB directly INTO the texture's memory.
-        // SDL_LockTexture gives us a pointer to the texture's pixel buffer and
-        // its pitch (= stride: bytes per row; SDL may pad rows too). Writing
-        // there avoids converting into our own buffer and then copying it.
+        // 5c. Get the texture's pixel memory. SDL_LockTexture gives us a pointer
+        // and its pitch (= stride: bytes per row; SDL may pad rows too).
         void* tex_pixels = nullptr;
         int   tex_pitch  = 0;
-        if (SDL_LockTexture(texture, nullptr, &tex_pixels, &tex_pitch) == 0) {
+        const bool locked = SDL_LockTexture(texture, nullptr, &tex_pixels, &tex_pitch) == 0;
+
+        // 5d. Convert YUYV -> RGB. With no filter, write straight into the
+        // texture and skip a copy. With a filter, write into 'rgb', because the
+        // filter needs separate input and output buffers.
+        if (locked) {
             auto t0 = Clock::now();
-            vc::yuyv_to_rgb24(f.data, static_cast<int>(cap.stride),
-                              static_cast<uint8_t*>(tex_pixels), tex_pitch,
-                              static_cast<int>(cap.width), static_cast<int>(cap.height));
+            if (filter == vc::Filter::None)
+                vc::yuyv_to_rgb24(f.data, static_cast<int>(cap.stride),
+                                  static_cast<uint8_t*>(tex_pixels), tex_pitch, width, height);
+            else
+                vc::yuyv_to_rgb24(f.data, static_cast<int>(cap.stride),
+                                  rgb.data(), rgb_image.stride, width, height);
             convert_ms_sum += ms_since(t0);
-            SDL_UnlockTexture(texture);   // SDL uploads the pixels to the GPU
         }
 
-        // 5d. Give the camera buffer back AS SOON AS we've read it, before
-        // drawing. The fewer buffers we hold, the less chance the driver runs
-        // out of empty ones and drops a frame.
-        if (capture_requeue(&cap, &f) != 0) {
+        // 5e. Give the camera buffer back AS SOON AS we've read it. This now
+        // happens BEFORE the filter: a slow filter works on our own copy in
+        // 'rgb', so it doesn't keep a driver buffer out of circulation.
+        const bool requeued = capture_requeue(&cap, &f) == 0;
+
+        // 5f. Run the filter from 'rgb' into the texture, then unlock, which
+        // makes SDL upload the pixels to the GPU.
+        if (locked) {
+            if (requeued && filter != vc::Filter::None) {
+                const vc::Image out{static_cast<uint8_t*>(tex_pixels), width, height, tex_pitch};
+                auto t0 = Clock::now();
+                runner.apply(filter, params, rgb_image, out);
+                filter_ms_sum += ms_since(t0);
+            }
+            SDL_UnlockTexture(texture);
+        }
+        if (!requeued) {
             exit_code = EXIT_FAILURE;
             break;
         }
 
-        // 5e. Draw: clear, copy the texture to the window (scaled to fit), show.
+        // 5g. Draw: clear, copy the texture to the window (scaled to fit), show.
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, texture, nullptr, nullptr);
         SDL_RenderPresent(renderer);     // swap the finished image onto the screen
@@ -205,17 +287,20 @@ int main(int argc, char** argv)
         ++frames_total;
         ++frames_window;
 
-        // 5f. Once per second: update the title with FPS and timings.
+        // 5h. Once per second: update the title with the filter, FPS and timings.
         double elapsed = ms_since(window_start);
         if (elapsed >= 1000.0) {
             double fps = frames_window * 1000.0 / elapsed;
-            char title[128];
+            char title[192];
             std::snprintf(title, sizeof(title),
-                          "Virtual Camera - %.1f fps | convert %.2f ms | dropped %ld",
-                          fps, convert_ms_sum / frames_window, dropped_total);
+                          "%s (b %+d, c %.1f) | %.1f fps | convert %.2f ms | filter %.2f ms | dropped %ld",
+                          vc::filter_name(filter), params.brightness, params.contrast, fps,
+                          convert_ms_sum / frames_window, filter_ms_sum / frames_window,
+                          dropped_total);
             SDL_SetWindowTitle(window, title);
             frames_window  = 0;
             convert_ms_sum = 0.0;
+            filter_ms_sum  = 0.0;
             window_start   = Clock::now();
         }
 
